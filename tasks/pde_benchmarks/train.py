@@ -205,14 +205,28 @@ def load_pipe(data_path, ntrain, ntest, downsamplex=1, downsampley=1):
 # Unified training loop
 # ---------------------------------------------------------------------------
 
+
 def train_pde(model, data_info, cfg):
+    from tasks.pde_benchmarks.temporal_eval import (
+        _as_output_frame,
+        add_state_noise,
+        evaluate_complete_trajectories,
+        shift_history_tokens,
+    )
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     myloss = TestLoss(size_average=False)
     task_type = data_info['task_type']
     ntrain = data_info['x_train'].shape[0]
     ntest = data_info['x_test'].shape[0]
-    batch_size = cfg.get('batch_size', 8)
+    configured_batch_size = int(cfg.get('batch_size', 8))
+    physical_batch_size = int(cfg.get('physical_batch_size', configured_batch_size))
+    if physical_batch_size < 1 or physical_batch_size > configured_batch_size:
+        raise ValueError('physical_batch_size must be between 1 and batch_size')
+    if configured_batch_size % physical_batch_size != 0:
+        raise ValueError('batch_size must be divisible by physical_batch_size for equivalent accumulation')
+    accumulation_steps = configured_batch_size // physical_batch_size
     epochs = cfg.get('epochs', 500)
     lr = cfg.get('lr', 1e-3)
     weight_decay = cfg.get('weight_decay', 1e-5)
@@ -234,43 +248,46 @@ def train_pde(model, data_info, cfg):
     resolution = data_info.get('resolution', 64)
     dx = 1.0 / resolution if use_derivative_loss else None
 
-    # Build data loaders
-    if task_type == 'ns':
+    # Build data loaders.  Temporal benchmark inputs are already arranged in
+    # the same per-point token layout used by the official NS loader.
+    if task_type in ('ns', 'temporal'):
         pos_train = data_info['pos'].repeat(ntrain, 1, 1)
         pos_test = data_info['pos'].repeat(ntest, 1, 1)
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(pos_train, data_info['x_train'], data_info['y_train']),
-            batch_size=batch_size, shuffle=True)
+            batch_size=physical_batch_size, shuffle=True)
         test_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(pos_test, data_info['x_test'], data_info['y_test']),
-            batch_size=batch_size, shuffle=False)
+            batch_size=physical_batch_size, shuffle=False)
     elif task_type in ('grid',):
         pos_train = data_info['pos'].repeat(ntrain, 1, 1)
         pos_test = data_info['pos'].repeat(ntest, 1, 1)
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(pos_train, data_info['x_train'], data_info['y_train']),
-            batch_size=batch_size, shuffle=True)
+            batch_size=physical_batch_size, shuffle=True)
         test_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(pos_test, data_info['x_test'], data_info['y_test']),
-            batch_size=batch_size, shuffle=False)
+            batch_size=physical_batch_size, shuffle=False)
     elif task_type == 'elasticity':
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data_info['x_train'], data_info['x_train'], data_info['y_train']),
-            batch_size=batch_size, shuffle=True)
+            batch_size=physical_batch_size, shuffle=True)
         test_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data_info['x_test'], data_info['x_test'], data_info['y_test']),
-            batch_size=batch_size, shuffle=False)
+            batch_size=physical_batch_size, shuffle=False)
     else:
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data_info['x_train'], data_info['x_train'], data_info['y_train']),
-            batch_size=batch_size, shuffle=True)
+            batch_size=physical_batch_size, shuffle=True)
         test_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data_info['x_test'], data_info['x_test'], data_info['y_test']),
-            batch_size=batch_size, shuffle=False)
+            batch_size=physical_batch_size, shuffle=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_steps_per_epoch = (len(train_loader) + accumulation_steps - 1) // accumulation_steps
     if scheduler_type == 'OneCycleLR':
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, epochs=epochs, steps_per_epoch=len(train_loader))
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=lr, epochs=epochs, steps_per_epoch=optimizer_steps_per_epoch)
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -280,56 +297,83 @@ def train_pde(model, data_info, cfg):
     setup_file_logger(os.path.join(save_dir, 'log.txt'))
 
     start_epoch = 0
-    resume_from = cfg.get('resume_from', None)
-    if resume_from and os.path.exists(resume_from):
-        logger.info(f"Resuming from checkpoint: {resume_from}")
+    resume_from = cfg.get('checkpoint') if cfg.get('eval_only', False) else cfg.get('resume_from', None)
+    if resume_from:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f'Checkpoint not found: {resume_from}')
+        logger.info(f"Loading checkpoint: {resume_from}")
         checkpoint = torch.load(resume_from, map_location='cpu')
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
             model.load_state_dict(checkpoint['model'])
-            if 'optimizer' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
-            if 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
-                scheduler.load_state_dict(checkpoint['scheduler'])
-            start_epoch = checkpoint.get('epoch', 0) + 1
+            if not cfg.get('eval_only', False):
+                if 'optimizer' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                if 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
+                    scheduler.load_state_dict(checkpoint['scheduler'])
+                start_epoch = checkpoint.get('epoch', 0) + 1
         else:
-            # Legacy checkpoint: only model state_dict
             model.load_state_dict(checkpoint)
-            start_epoch = 0
-        logger.info(f"Resumed training from epoch {start_epoch}")
+        logger.info(f"Loaded checkpoint; start epoch {start_epoch}")
+
+    if cfg.get('eval_only', False):
+        if task_type != 'temporal':
+            raise ValueError('--eval complete-trajectory mode is implemented for temporal benchmark tasks only')
+        metrics = evaluate_complete_trajectories(model, data_info, cfg, device)
+        logger.info(f"Complete-trajectory metrics: {metrics}")
+        return model
 
     for ep in range(start_epoch, epochs):
         model.train()
-        train_loss = 0
+        train_loss = 0.0
 
-        if task_type == 'ns':
+        if task_type in ('ns', 'temporal'):
             noise_std = cfg.get('noise_std', 0.0)
             T_out = data_info['T_out']
-            for x, fx, yy in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            micro_batches = 0
+            for batch_idx, (x, fx, yy) in enumerate(train_loader):
                 loss = 0
                 x, fx, yy = x.to(device), fx.to(device), yy.to(device)
                 bsz = x.shape[0]
-                if noise_std > 0:
-                    scale_factor = fx[0].numel() ** 0.5
-                    norm_x = torch.sum(fx ** 2, dim=(1, 2), keepdim=True) ** 0.5
-                    fx = fx + noise_std * (norm_x / scale_factor) * torch.randn_like(fx)
-                for t in range(0, T_out):
-                    y = yy[..., t:t + 1]
-                    im = model(fx, x)
-                    loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
-                    im = im.unsqueeze(-1)
-                    if t == 0:
-                        pred = im
-                    else:
-                        pred = torch.cat((pred, im), -1)
-                    fx = torch.cat((fx[..., 1:], y), dim=-1)
+
+                if task_type == 'ns':
+                    if noise_std > 0:
+                        scale_factor = fx[0].numel() ** 0.5
+                        norm_x = torch.sum(fx ** 2, dim=(1, 2), keepdim=True) ** 0.5
+                        fx = fx + noise_std * (norm_x / scale_factor) * torch.randn_like(fx)
+                    for t in range(T_out):
+                        y = yy[..., t:t + 1]
+                        im = model(fx, x)
+                        loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
+                        fx = torch.cat((fx[..., 1:], y), dim=-1)
+                else:
+                    T_in = data_info['T_in']
+                    frame_channels = data_info['frame_channels']
+                    dynamic_channels = data_info['dynamic_channels']
+                    fx = add_state_noise(
+                        fx, noise_std, T_in=T_in, frame_channels=frame_channels,
+                        dynamic_channels=dynamic_channels)
+                    for t in range(T_out):
+                        y = yy[..., t, :]  # [B,P,C_state]
+                        im = _as_output_frame(model(fx, x), dynamic_channels)
+                        loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
+                        # Official teacher forcing: append ground truth, not prediction.
+                        fx = shift_history_tokens(
+                            fx, y, T_in=T_in, frame_channels=frame_channels,
+                            dynamic_channels=dynamic_channels)
+
                 train_loss += loss.item() / T_out
-                optimizer.zero_grad()
                 loss.backward()
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                if scheduler_type == 'OneCycleLR':
-                    scheduler.step()
+                micro_batches += 1
+                do_step = micro_batches == accumulation_steps or batch_idx == len(train_loader) - 1
+                if do_step:
+                    if max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler_type == 'OneCycleLR':
+                        scheduler.step()
+                    micro_batches = 0
         else:
             for batch in train_loader:
                 if len(batch) == 3:
@@ -339,7 +383,6 @@ def train_pde(model, data_info, cfg):
                 pos_or_x = pos_or_x.to(device)
                 fx_or_pos = fx_or_pos.to(device)
                 y = y.to(device)
-
                 optimizer.zero_grad()
 
                 if task_type in ('pipe', 'airfoil_pde', 'elasticity'):
@@ -354,9 +397,7 @@ def train_pde(model, data_info, cfg):
                     y_decoded = y
 
                 l2loss = myloss(out, y_decoded) if y_normalizer is not None else myloss(out, y)
-
                 if use_derivative_loss:
-                    # Derivative regularization via central differences
                     s = resolution
                     out_padded = rearrange(out.unsqueeze(-1), 'b (h w) c -> b c h w', h=s)
                     out_padded = out_padded[..., 1:-1, 1:-1].contiguous()
@@ -382,29 +423,44 @@ def train_pde(model, data_info, cfg):
 
         train_loss /= ntrain
 
-        # Evaluation
+        # Preserve the official per-epoch test protocol.  For temporal tasks
+        # this is the configured T_out-step autoregressive window; complete
+        # trajectories are evaluated separately after training.
         model.eval()
         rel_err = 0.0
         test_full_loss = 0.0
         with torch.no_grad():
-            if task_type == 'ns':
+            if task_type in ('ns', 'temporal'):
                 T_out = data_info['T_out']
                 for x, fx, yy in test_loader:
                     loss = 0
                     x, fx, yy = x.to(device), fx.to(device), yy.to(device)
                     bsz = x.shape[0]
-                    for t in range(0, T_out):
-                        y = yy[..., t:t + 1]
-                        im = model(fx, x)
-                        loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
-                        im = im.unsqueeze(-1)
-                        if t == 0:
-                            pred = im
+                    preds = []
+                    for t in range(T_out):
+                        if task_type == 'ns':
+                            y = yy[..., t:t + 1]
+                            im = model(fx, x)
+                            loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
+                            im_frame = im.unsqueeze(-1)
+                            fx = torch.cat((fx[..., 1:], im_frame), dim=-1)
+                            preds.append(im_frame)
                         else:
-                            pred = torch.cat((pred, im), -1)
-                        fx = torch.cat((fx[..., 1:], im), dim=-1)
+                            y = yy[..., t, :]
+                            im = _as_output_frame(model(fx, x), data_info['dynamic_channels'])
+                            loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
+                            fx = shift_history_tokens(
+                                fx, im, T_in=data_info['T_in'],
+                                frame_channels=data_info['frame_channels'],
+                                dynamic_channels=data_info['dynamic_channels'])
+                            preds.append(im)
                     rel_err += loss.item()
-                    test_full_loss += myloss(pred.reshape(bsz, -1), yy.reshape(bsz, -1)).item()
+                    if task_type == 'ns':
+                        pred = torch.cat(preds, -1)
+                        test_full_loss += myloss(pred.reshape(bsz, -1), yy.reshape(bsz, -1)).item()
+                    else:
+                        pred = torch.stack(preds, dim=2)
+                        test_full_loss += myloss(pred.reshape(bsz, -1), yy.reshape(bsz, -1)).item()
             else:
                 for batch in test_loader:
                     if len(batch) == 3:
@@ -414,21 +470,20 @@ def train_pde(model, data_info, cfg):
                     pos_or_x = pos_or_x.to(device)
                     fx_or_pos = fx_or_pos.to(device)
                     y = y.to(device)
-
                     if task_type in ('pipe', 'airfoil_pde', 'elasticity'):
                         out = model(None, pos_or_x).squeeze(-1)
                     else:
                         out = model(fx_or_pos, pos_or_x).squeeze(-1)
-
                     if y_normalizer is not None:
                         out = y_normalizer.decode(out)
-                    tl = myloss(out, y).item()
-                    rel_err += tl
+                    rel_err += myloss(out, y).item()
 
-        rel_err /= ntest * T_out if task_type == 'ns' else ntest
-        if task_type == 'ns':
+        rel_err /= ntest * data_info['T_out'] if task_type in ('ns', 'temporal') else ntest
+        if task_type in ('ns', 'temporal'):
             test_full_loss /= ntest
-            logger.info(f"Epoch {ep} Train loss: {train_loss:.5f} test_step_loss: {rel_err:.5f} test_full_loss: {test_full_loss:.5f}")
+            logger.info(
+                f"Epoch {ep} Train loss: {train_loss:.5f} "
+                f"test_step_loss: {rel_err:.5f} test_full_loss: {test_full_loss:.5f}")
         else:
             logger.info(f"Epoch {ep} Train loss: {train_loss:.5f} rel_err: {rel_err:.5f}")
 
@@ -441,4 +496,7 @@ def train_pde(model, data_info, cfg):
             }
             torch.save(checkpoint, os.path.join(save_dir, f'{save_name}.pt'))
 
+    if task_type == 'temporal':
+        metrics = evaluate_complete_trajectories(model, data_info, cfg, device)
+        logger.info(f"Complete-trajectory metrics: {metrics}")
     return model
