@@ -1,0 +1,335 @@
+"""Block wrappers that compose attention modules with LayerNorm, FFN, and residuals.
+
+Block hierarchy:
+    DualExactBlock  — wraps DualExactStateAttention (CoEvol-NO)
+    PCFFN           — Predictor-Corrector FFN (optional replacement for standard FFN)
+    LatentBlock     — wraps StateAttentionLatent (State-Evol ablation)
+    SequenceBlock   — per-layer local latents (Coords-Evol ablation)
+
+Each block follows the Pre-Norm Transformer pattern:
+    x = x + Attention(LayerNorm(x))
+    x = x + FFN(LayerNorm(x))
+with LayerScale and DropPath for stable deep training.
+"""
+
+import math
+import torch
+import torch.nn as nn
+from timm.models.layers import DropPath, Mlp
+
+from coevol_no.layers import LayerScale
+from coevol_no.attention import DualExactStateAttention, StateAttentionLatent
+from coevol_no.analytical import _gelu_derivative, _layernorm_backward
+
+
+# ===========================================================================
+# PCFFN: Predictor-Corrector FFN
+# ===========================================================================
+
+class PCFFN(nn.Module):
+    """Predictor-Corrector FFN with optional analytical gradient.
+
+    Replaces the standard residual FFN ``x + FFN(LN(x))`` with a
+    Predictor-Corrector update that computes the exact gradient of a
+    correction loss and updates x accordingly.
+
+    When ``analytical=True`` (default), uses explicit backprop formulas
+    instead of ``torch.autograd.grad``, providing ~1.5x speedup.
+    """
+
+    def __init__(self, dim, hidden_dim=None, drop_path=0., init_values=1e-5,
+                 act_layer=nn.GELU, loss_type='dot product',
+                 momentum_beta=0.9, approximate=False, analytical=True):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim or dim * 4
+        self.loss_type = loss_type
+        self.momentum_beta = momentum_beta
+        self.approximate = approximate
+        self.analytical = analytical
+
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, self.hidden_dim)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(self.hidden_dim, dim)
+        self.eta = nn.Parameter(init_values * torch.ones(dim))
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def _gradient_autograd(self, x):
+        with torch.enable_grad():
+            xp = x.clone().requires_grad_(True)
+            xn = self.norm(xp)
+            x_pred = self.fc2(self.act(self.fc1(xn)))
+            if self.loss_type == 'l2':
+                loss = torch.sum((xp - x_pred) ** 2) / 2.0
+            else:
+                loss = -torch.einsum('bnc,bnc->b', xp, x_pred).sum()
+            return torch.autograd.grad(loss, xp, create_graph=True)[0]
+
+    def _gradient_analytical(self, x):
+        xn = self.norm(x)
+        h = self.fc1(xn)
+        a = self.act(h)
+        x_pred = self.fc2(a)
+
+        if self.loss_type == 'dot product':
+            upstream, direct = -x, -x_pred
+        else:
+            diff = x - x_pred
+            upstream, direct = -diff, diff
+
+        g = upstream @ self.fc2.weight
+        g = g * _gelu_derivative(h)
+        g = g @ self.fc1.weight
+        g = _layernorm_backward(g, x, self.norm)
+        return direct + g
+
+    def forward(self, x, momentum_in=None):
+        if momentum_in is None:
+            momentum_in = torch.zeros_like(x)
+
+        if self.approximate:
+            x_pred = self.fc2(self.act(self.fc1(self.norm(x))))
+            delta = x_pred
+            momentum_out = momentum_in
+        elif self.analytical:
+            grad = self._gradient_analytical(x)
+            momentum_out = self.momentum_beta * momentum_in + grad
+            delta = momentum_out
+        else:
+            grad = self._gradient_autograd(x)
+            momentum_out = self.momentum_beta * momentum_in + grad
+            delta = momentum_out
+
+        return x - self.drop_path(self.eta * delta), momentum_out
+
+
+# ===========================================================================
+# DualExactBlock: Full CoEvol-NO (dual exact gradients for S and X)
+# ===========================================================================
+
+class DualExactBlock(nn.Module):
+    """Block wrapping DualExactStateAttention with FFN on the token side.
+
+    The primary block of CoEvol-NO.  Both S and X are updated via
+    Predictor-Corrector with (optionally) exact gradients.
+
+    When ``use_pc_ffn=True``, the standard residual FFN is replaced by
+    ``PCFFN`` which applies Predictor-Corrector to the FFN layer as well.
+    """
+
+    def __init__(self, dim_lat, dim_tok, num_heads=8, mlp_ratio=4.,
+                 drop_path=0., init_values=1e-5, qkv_bias=True,
+                 act_layer=nn.GELU,
+                 # PC parameters
+                 x_exact_update=True, x_loss_type='dot product',
+                 x_momentum_beta=0.9, x_eta_init=1e-5,
+                 s_approximate=False, s_loss_type='dot product',
+                 s_momentum_beta=0.9, s_eta_init=1e-5,
+                 # Analytical gradient
+                 analytical=True,
+                 # PCFFN parameters
+                 use_pc_ffn=False, pc_ffn_loss_type='dot product',
+                 pc_ffn_momentum_beta=0.9, pc_ffn_analytical=True):
+        super().__init__()
+        self.use_pc_ffn = use_pc_ffn
+        self.norm_lat = nn.LayerNorm(dim_lat)
+        self.norm_tok = nn.LayerNorm(dim_tok)
+
+        # Core dual-exact PC attention
+        # Original StatefulBlock passes drop_path=0 into StateAttention and applies
+        # DropPath at the block level on the token residual.  Aligning this.
+        self.cross_attn = DualExactStateAttention(
+            dim_lat=dim_lat, dim_tok=dim_tok, num_heads=num_heads,
+            qkv_bias=qkv_bias, drop_path=0.,
+            s_loss_type=s_loss_type, s_momentum_beta=s_momentum_beta,
+            s_eta_init=s_eta_init,
+            x_exact_update=x_exact_update,
+            x_loss_type=x_loss_type, x_momentum_beta=x_momentum_beta,
+            x_eta_init=x_eta_init,
+            s_approximate=s_approximate, analytical=analytical,
+        )
+        # LayerScale on the token cross-attention residual, matching the original
+        # StatefulBlock design (ls_tok1 around the attention delta).
+        self.ls_tok1 = LayerScale(dim_tok, init_values)
+        self.drop_path_tok1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        if use_pc_ffn:
+            self.pc_ffn = PCFFN(
+                dim=dim_tok, hidden_dim=int(dim_tok * mlp_ratio),
+                drop_path=drop_path, init_values=init_values,
+                act_layer=act_layer, loss_type=pc_ffn_loss_type,
+                momentum_beta=pc_ffn_momentum_beta,
+                analytical=pc_ffn_analytical,
+            )
+        else:
+            self.norm_tok2 = nn.LayerNorm(dim_tok)
+            self.mlp_tok = Mlp(in_features=dim_tok, hidden_features=int(dim_tok * mlp_ratio), act_layer=act_layer)
+            self.ls_tok2 = LayerScale(dim_tok, init_values)
+            self.drop_path_tok2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x_lat, x_tok, momentum_s, momentum_x, momentum_ffn=None):
+        # Dual-exact PC update
+        # Keep the residual in the *raw* token space, matching the original
+        # StatefulBlock design: cross_attn receives normalized tokens and returns
+        # an updated normalized token; the delta is added back to the raw token.
+        x_tok_raw = x_tok
+        x_tok_norm = self.norm_tok(x_tok_raw)
+        x_lat, x_tok_norm_updated, momentum_s, momentum_x = self.cross_attn(
+            self.norm_lat(x_lat), x_tok_norm, momentum_s, momentum_x)
+        x_tok = x_tok_raw + self.drop_path_tok1(self.ls_tok1(x_tok_norm_updated - x_tok_norm))
+
+        # FFN
+        if self.use_pc_ffn:
+            x_tok, momentum_ffn = self.pc_ffn(x_tok, momentum_ffn)
+        else:
+            x_tok = x_tok + self.drop_path_tok2(self.ls_tok2(self.mlp_tok(self.norm_tok2(x_tok))))
+
+        return x_lat, x_tok, momentum_s, momentum_x, momentum_ffn
+
+
+# ===========================================================================
+# LatentBlock: State-Evol ablation (Encoder/Evolution/Decoder)
+# ===========================================================================
+
+class LatentBlock(nn.Module):
+    """Generic block for asymmetric Q/KV with PC update.
+
+    Used in three roles:
+    - Encoder:  Q=latent(S), KV=token(X)   → encode X into S
+    - Evolution: Q=latent(S), KV=latent(S)  → self-evolve S
+    - Decoder:  Q=token(X), KV=latent(S)    → decode S back to X
+    """
+
+    def __init__(self, dim_q, dim_kv, num_heads=8, mlp_ratio=4.,
+                 drop_path=0., init_values=1e-5, qkv_bias=True,
+                 act_layer=nn.GELU):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim_q)
+        self.norm_kv = nn.LayerNorm(dim_kv)
+
+        self.attn = StateAttentionLatent(
+            dim_q=dim_q, dim_kv=dim_kv, num_heads=num_heads,
+            qkv_bias=qkv_bias, drop_path=drop_path, init_values=init_values,
+        )
+
+        self.norm_mlp = nn.LayerNorm(dim_q)
+        self.mlp = Mlp(in_features=dim_q, hidden_features=int(dim_q * mlp_ratio), act_layer=act_layer)
+        self.ls_mlp = LayerScale(dim_q, init_values)
+        self.drop_path_mlp = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x_q, x_kv, momentum):
+        """Forward: PC update on Q attending to KV, then FFN.
+
+        Args:
+            x_q: Query tensor (being updated), shape ``(B, M, C_q)``.
+            x_kv: Key-Value tensor, shape ``(B, N, C_kv)``.
+            momentum: Momentum from previous layer.
+
+        Returns:
+            x_q, momentum: Updated Q and momentum.
+        """
+        x_q, momentum = self.attn(self.norm_q(x_q), self.norm_kv(x_kv), momentum)
+        x_q = x_q + self.drop_path_mlp(self.ls_mlp(self.mlp(self.norm_mlp(x_q))))
+        return x_q, momentum
+
+
+# ===========================================================================
+# SequenceBlock: Coords-Evol ablation (per-layer local latents)
+# ===========================================================================
+
+class SequenceBlock(nn.Module):
+    """Block with per-layer local latents (Coords-Evol ablation).
+
+    Unlike DualExactBlock, latents are re-initialized each layer (no persistent
+    state across layers).  Uses a simplified first-order gradient update.
+    """
+
+    def __init__(self, dim_lat, dim_tok, num_heads=8, mlp_ratio=4.,
+                 drop_path=0., init_values=1e-5, num_latents=128,
+                 qkv_bias=True, act_layer=nn.GELU):
+        super().__init__()
+        self.norm_lat = nn.LayerNorm(dim_lat)
+        self.norm_tok = nn.LayerNorm(dim_tok)
+        self.num_heads = num_heads
+
+        # S encoding path (S <- X)
+        self.q_lat_proj = nn.Linear(dim_lat, dim_lat, bias=qkv_bias)
+        self.k_tok_proj = nn.Linear(dim_tok, dim_lat, bias=qkv_bias)
+        self.v_tok_proj = nn.Linear(dim_tok, dim_lat, bias=qkv_bias)
+        self.scale_lat = (dim_lat // num_heads) ** -0.5
+
+        # X decoding path (X <- S)
+        self.q_tok_proj = nn.Linear(dim_tok, dim_tok, bias=qkv_bias)
+        self.k_lat_proj = nn.Linear(dim_lat, dim_tok, bias=qkv_bias)
+        self.v_lat_proj = nn.Linear(dim_lat, dim_tok, bias=qkv_bias)
+        self.proj_tok = nn.Linear(dim_tok, dim_tok)
+        self.scale_tok = (dim_tok // num_heads) ** -0.5
+
+        self.momentum_beta = 0.9
+        self.ls_lat = LayerScale(dim_lat, init_values)
+
+        # Token FFN
+        self.ls_tok1 = LayerScale(dim_tok, init_values)
+        self.drop_path_tok1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm_tok2 = nn.LayerNorm(dim_tok)
+        self.mlp_tok = Mlp(in_features=dim_tok, hidden_features=int(dim_tok * mlp_ratio), act_layer=act_layer)
+        self.ls_tok2 = LayerScale(dim_tok, init_values)
+        self.drop_path_tok2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        # Per-layer local latents (not shared across layers)
+        self.latents = nn.Parameter(torch.zeros(1, num_latents, dim_lat))
+        nn.init.normal_(self.latents, mean=0.0, std=0.1)
+
+    def forward(self, x_tok, momentum):
+        """Forward: first-order PC update with per-layer latents.
+
+        Args:
+            x_tok: Token Sequence X, shape ``(B, N, C_tok)``.
+            momentum: Momentum from previous layer.
+
+        Returns:
+            x_tok, momentum, x_lat: Updated X, momentum, and local latents.
+        """
+        import torch.nn.functional as F
+
+        B, N, C_tok = x_tok.shape
+        x_lat = self.latents.expand(B, -1, -1)
+        M, C_lat = x_lat.shape[1], x_lat.shape[2]
+        head_dim_lat = C_lat // self.num_heads
+        head_dim_tok = C_tok // self.num_heads
+
+        if momentum is None:
+            momentum = torch.zeros_like(x_lat)
+
+        x_lat_n = self.norm_lat(x_lat)
+        x_tok_n = self.norm_tok(x_tok)
+
+        # ========== Step 1: S encoding (S <- X, first-order) ==========
+        q_lat = x_lat_n.reshape(B, M, self.num_heads, head_dim_lat).permute(0, 2, 1, 3)
+        k = self.k_tok_proj(x_tok_n).reshape(B, N, self.num_heads, head_dim_lat).permute(0, 2, 1, 3)
+        v = self.v_tok_proj(x_tok_n).reshape(B, N, self.num_heads, head_dim_lat).permute(0, 2, 1, 3)
+
+        delta_lat_val = F.scaled_dot_product_attention(q_lat, k, v)
+        delta_lat_flat = delta_lat_val.permute(0, 2, 1, 3).reshape(B, M, C_lat)
+        grad_direct = x_lat_n - delta_lat_flat
+
+        # S momentum + update (first-order)
+        momentum = self.momentum_beta * momentum + grad_direct
+        delta_S = momentum.to(self.ls_lat.eta.dtype)
+        x_lat_final = x_lat - self.ls_lat(delta_S)
+
+        # ========== Step 2: X decoding (X <- S) ==========
+        q_tok = self.q_tok_proj(x_tok_n).reshape(B, N, self.num_heads, head_dim_tok).permute(0, 2, 1, 3)
+        k_lat = self.k_lat_proj(x_lat_final).reshape(B, M, self.num_heads, head_dim_tok).permute(0, 2, 1, 3)
+        v_lat = self.v_lat_proj(delta_S).reshape(B, M, self.num_heads, head_dim_tok).permute(0, 2, 1, 3)
+
+        delta_tok = F.scaled_dot_product_attention(q_tok, k_lat, v_lat)
+        delta_tok = delta_tok.transpose(1, 2).reshape(B, N, C_tok)
+        out_tok = self.proj_tok(delta_tok)
+
+        # X residual + FFN
+        x_tok = x_tok + self.drop_path_tok1(self.ls_tok1(out_tok))
+        x_tok = x_tok + self.drop_path_tok2(self.ls_tok2(self.mlp_tok(self.norm_tok2(x_tok))))
+
+        return x_tok, momentum, x_lat
