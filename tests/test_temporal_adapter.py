@@ -5,6 +5,7 @@ import torch.nn as nn
 from coevol_no.wrapper import OperatorNet
 from tasks.pde_benchmarks.temporal_data import (
     _tokens,
+    TemporalWindowDataset,
     compute_stats,
     denormalize_fields,
     normalize_fields,
@@ -73,6 +74,41 @@ def test_condition_token_layout_is_frame_major_channel_concat():
     # Every temporal block is [state_ch0, state_ch1, scalar_parameter].
     assert frames.shape[-1] == 3
     np.testing.assert_allclose(frames[..., 2], -1.0)
+
+
+
+def test_training_window_samples_from_full_trajectory(monkeypatch):
+    fields = np.zeros((1, 6, 1, 2, 2), dtype=np.float32)
+    for t in range(fields.shape[1]):
+        fields[:, t] = float(t)
+    parameters = np.array([1.0], dtype=np.float32)
+    stats = compute_stats(fields, parameters)
+    dataset = TemporalWindowDataset(
+        fields,
+        parameters,
+        stats,
+        T_in=2,
+        T_out=2,
+        include_parameter=False,
+    )
+
+    calls = []
+
+    def fake_randint(low, high):
+        calls.append((low, high))
+        return 2
+
+    monkeypatch.setattr(np.random, "randint", fake_randint)
+    pos, tokens, targets = dataset[0]
+    assert calls == [(0, 3)]
+    assert pos.shape == (4, 2)
+
+    expected_history = normalize_fields(fields[:, 2:4], stats)[0]
+    expected_tokens = np.transpose(expected_history, (2, 3, 0, 1)).reshape(4, 2)
+    expected_targets = normalize_fields(fields[:, 4:6], stats)[0]
+    expected_targets = np.transpose(expected_targets, (2, 3, 0, 1)).reshape(4, 2, 1)
+    np.testing.assert_allclose(tokens.numpy(), expected_tokens, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(targets.numpy(), expected_targets, rtol=1e-6, atol=1e-6)
 
 
 def test_history_shift_replaces_one_complete_frame_block():

@@ -218,7 +218,7 @@ def train_pde(model, data_info, cfg):
     model = model.to(device)
     myloss = TestLoss(size_average=False)
     task_type = data_info['task_type']
-    ntrain = data_info['x_train'].shape[0]
+    ntrain = data_info['ntrain'] if task_type == 'temporal' else data_info['x_train'].shape[0]
     ntest = data_info['x_test'].shape[0]
     configured_batch_size = int(cfg.get('batch_size', 8))
     physical_batch_size = int(cfg.get('physical_batch_size', configured_batch_size))
@@ -248,9 +248,17 @@ def train_pde(model, data_info, cfg):
     resolution = data_info.get('resolution', 64)
     dx = 1.0 / resolution if use_derivative_loss else None
 
-    # Build data loaders.  Temporal benchmark inputs are already arranged in
-    # the same per-point token layout used by the official NS loader.
-    if task_type in ('ns', 'temporal'):
+    # Build data loaders. Temporal training follows common_0821: every
+    # trajectory samples one random T_in+T_out window on each dataset access.
+    # The model-side rollout inside that window remains CoEvol-NO teacher forcing.
+    if task_type == 'temporal':
+        train_loader = torch.utils.data.DataLoader(
+            data_info['train_dataset'], batch_size=physical_batch_size, shuffle=True)
+        pos_test = data_info['pos'].repeat(ntest, 1, 1)
+        test_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(pos_test, data_info['x_test'], data_info['y_test']),
+            batch_size=physical_batch_size, shuffle=False)
+    elif task_type == 'ns':
         pos_train = data_info['pos'].repeat(ntrain, 1, 1)
         pos_test = data_info['pos'].repeat(ntest, 1, 1)
         train_loader = torch.utils.data.DataLoader(

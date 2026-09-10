@@ -2,8 +2,9 @@
 
 The loaders in this module follow the benchmark split and min-max preprocessing
 conventions from common_0821, but expose tensors in the native CoEvol-NO PDE
-runner format.  Training uses the official Navier--Stokes protocol: the first
-``T_in`` frames form the history and the next ``T_out`` frames are the
+runner format.  For training, each trajectory contributes one random contiguous
+``T_in + T_out`` window per access, matching common_0821: the first ``T_in``
+frames of that window form the history and the next ``T_out`` frames are the
 teacher-forced targets.  Complete trajectories are retained separately for
 final autoregressive evaluation.
 """
@@ -164,6 +165,89 @@ def _tokens(
     return frames.reshape(n, h * w, -1).astype(np.float32)
 
 
+class TemporalWindowDataset(torch.utils.data.Dataset):
+    """Random temporal windows matching common_0821 ``WindowDataset``.
+
+    The dataset length equals the number of trajectories. Each ``__getitem__``
+    samples one contiguous ``T_in + T_out`` window from the selected trajectory,
+    so a shuffled epoch sees every trajectory once with a newly sampled window.
+    Returned tensors already use the native CoEvol-NO point-token layout.
+    """
+
+    def __init__(
+        self,
+        fields: np.ndarray,
+        parameters: np.ndarray,
+        stats: TemporalStats,
+        T_in: int,
+        T_out: int,
+        *,
+        include_parameter: bool,
+        static: np.ndarray | None = None,
+        pos: torch.Tensor | None = None,
+    ) -> None:
+        self.fields = _as_fields(fields)
+        self.parameters = np.asarray(parameters, dtype=np.float32).reshape(-1)
+        self.static = None if static is None else np.asarray(static, dtype=np.float32)
+        self.stats = stats
+        self.T_in = int(T_in)
+        self.T_out = int(T_out)
+        self.include_parameter = bool(include_parameter)
+        required = self.T_in + self.T_out
+        if self.fields.shape[1] < required:
+            raise ValueError(
+                f"Trajectory length {self.fields.shape[1]} is shorter than T_in+T_out={required}."
+            )
+        if len(self.parameters) != len(self.fields):
+            raise ValueError("Parameter and trajectory counts must match.")
+        if self.static is not None and len(self.static) != len(self.fields):
+            raise ValueError("Static-condition and trajectory counts must match.")
+        self.max_start = self.fields.shape[1] - required
+        resolution = int(self.fields.shape[-1])
+        self.pos = _grid(resolution).squeeze(0) if pos is None else pos.squeeze(0)
+
+    def __len__(self) -> int:
+        return len(self.fields)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        index = int(item)
+        start = int(np.random.randint(0, self.max_start + 1))
+        stop = start + self.T_in
+        target_stop = stop + self.T_out
+
+        history = normalize_fields(self.fields[index:index + 1, start:stop], self.stats)[0]
+        _, _, h, w = history.shape
+        frame_parts = [history]
+
+        if self.static is not None:
+            static_norm = normalize_static(self.static[index:index + 1], self.stats)[0]
+            static_frames = np.broadcast_to(
+                static_norm[None], (self.T_in, *static_norm.shape)
+            )
+            frame_parts.append(static_frames)
+
+        if self.include_parameter:
+            parameter = float(
+                normalize_parameter(self.parameters[index:index + 1], self.stats)[0]
+            )
+            parameter_frames = np.full(
+                (self.T_in, 1, h, w), parameter, dtype=np.float32
+            )
+            frame_parts.append(parameter_frames)
+
+        frames = np.concatenate(frame_parts, axis=1)
+        tokens = np.transpose(frames, (2, 3, 0, 1)).reshape(h * w, -1).astype(np.float32)
+
+        targets = normalize_fields(
+            self.fields[index:index + 1, stop:target_stop], self.stats
+        )[0]
+        targets = np.transpose(targets, (2, 3, 0, 1)).reshape(
+            h * w, self.T_out, self.fields.shape[2]
+        ).astype(np.float32)
+
+        return self.pos, torch.from_numpy(tokens), torch.from_numpy(targets)
+
+
 def _make_split(
     fields: np.ndarray,
     parameters: np.ndarray,
@@ -203,9 +287,16 @@ def _finalize(
     if train_fields.shape[-1] != train_fields.shape[-2]:
         raise ValueError("CoEvol-NO temporal adapter currently expects square spatial grids.")
     stats = compute_stats(train_fields, train_parameters, train_static)
-    train = _make_split(
-        train_fields, train_parameters, stats, T_in, T_out,
-        include_parameter=include_parameter, static=train_static,
+    pos = _grid(int(train_fields.shape[-1]))
+    train_dataset = TemporalWindowDataset(
+        train_fields,
+        train_parameters,
+        stats,
+        T_in,
+        T_out,
+        include_parameter=include_parameter,
+        static=train_static,
+        pos=pos,
     )
 
     prepared_tests: Dict[str, dict] = {}
@@ -222,13 +313,13 @@ def _finalize(
     frame_channels = dynamic_channels + static_channels + parameter_channels
     resolution = int(train_fields.shape[-1])
 
-    train["static"] = None if train_static is None else normalize_static(train_static, stats)
+    train_static_normalized = None if train_static is None else normalize_static(train_static, stats)
     return {
-        "x_train": train["x"],
-        "y_train": train["y"],
+        "train_dataset": train_dataset,
+        "ntrain": len(train_dataset),
         "x_test": next(iter(prepared_tests.values()))["x"],
         "y_test": next(iter(prepared_tests.values()))["y"],
-        "pos": _grid(resolution),
+        "pos": pos,
         "resolution": resolution,
         "in_channels": T_in * frame_channels,
         "out_channels": dynamic_channels,
@@ -242,7 +333,7 @@ def _finalize(
         "frame_channels": frame_channels,
         "stats": stats,
         "train_parameters": train_parameters.astype(np.float32),
-        "train_static": train["static"],
+        "train_static": train_static_normalized,
         "test_splits": prepared_tests,
         "dataset": task,
     }
