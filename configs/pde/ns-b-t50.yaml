@@ -1,0 +1,47 @@
+model:
+  name: CoEvolNO
+  variant: s_exact
+  depth: 8
+  dim_lat: 128
+  dim_tok: 128
+  num_latents: 128
+  num_heads: 8
+  mlp_ratio: 1.0
+  drop_path_rate: 0.1
+  qkv_bias: false
+  x_exact_update: false
+  s_approximate: false
+  s_loss_type: dot product
+  s_momentum_beta: 0.9
+  s_eta_init: 1.0e-5
+  analytical: true
+  x_loss_type: dot product
+  x_momentum_beta: 0.0
+  x_eta_init: 1.0e-5
+  use_pc_ffn: false
+  pc_ffn_loss_type: dot product
+  pc_ffn_momentum_beta: 0.9
+  pc_ffn_analytical: true
+  final_norm: false
+  unified_pos: false
+  ref: 8
+  use_wrapper: true
+
+training:
+  lr: 0.001
+  epochs: 500
+  batch_size: 2
+  scheduler: OneCycleLR
+  weight_decay: 1.0e-5
+  noise_std: 0.01
+  max_grad_norm: null
+  test_batch_size: 1
+  save_dir: ./checkpoints/ns-b-t50
+  result_dir: ./results
+
+data:
+  task: ns-b-t50
+  data_path: /home/ubuntu/Project/LPM/Dataset
+  T_in: 10
+  T_out: 10
+  seed: 0

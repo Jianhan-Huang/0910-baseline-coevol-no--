@@ -15,6 +15,7 @@ from coevol_no import CoEvolNO, CoEvolNOLatent, CoEvolNOSequence, OperatorNet
 from tasks.pde_benchmarks.train import (
     set_seed, load_darcy, load_ns, load_elasticity, load_airfoil_pde, load_pipe, train_pde
 )
+from tasks.pde_benchmarks.temporal_data import TEMPORAL_TASKS, load_temporal
 
 
 MODEL_REGISTRY = {
@@ -53,7 +54,7 @@ def build_model(cfg, data_info):
             momentum_beta=model_cfg.get('s_momentum_beta', 0.9),
             init_values=1e-5,
         )
-        return _OperatorNet(branch, num_basis=n_hidden, resolution=res)
+        return _OperatorNet(branch, num_basis=n_hidden, resolution=res, out_channels=data_info.get('out_channels', 1))
 
     # --- CoEvol-NO family ---
     common_kwargs = {
@@ -67,7 +68,6 @@ def build_model(cfg, data_info):
         'num_heads': model_cfg.get('num_heads', 8),
         'mlp_ratio': model_cfg.get('mlp_ratio', 1.0),
         'drop_path_rate': model_cfg.get('drop_path_rate', 0.1),
-        'attn_drop_path': model_cfg.get('attn_drop_path', 0.),
         'qkv_bias': model_cfg.get('qkv_bias', True),
         # PC attention
         'x_exact_update': model_cfg.get('x_exact_update', False),
@@ -103,6 +103,7 @@ def build_model(cfg, data_info):
             branch=branch,
             num_basis=model_cfg.get('dim_tok', 128),
             resolution=res,
+            out_channels=data_info.get('out_channels', 1),
         )
     else:
         model = branch
@@ -115,6 +116,7 @@ LOADERS = {
     'elasticity': load_elasticity,
     'airfoil': load_airfoil_pde,
     'pipe': load_pipe,
+    **{task: load_temporal for task in TEMPORAL_TASKS},
 }
 
 
@@ -124,6 +126,7 @@ def main():
     parser.add_argument('--data_path', type=str, default=None, help='Override data path')
     parser.add_argument('--gpu', type=str, default='0')
     parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint for evaluation-only mode')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -144,6 +147,13 @@ def main():
         torch.cuda.set_device(int(args.gpu))
 
     loader_kwargs = {'data_path': data_path, 'ntrain': ntrain, 'ntest': ntest}
+    if task in TEMPORAL_TASKS:
+        loader_kwargs = {
+            'data_path': data_path,
+            'task': task,
+            'T_in': data_cfg.get('T_in', 10),
+            'T_out': data_cfg.get('T_out', 10),
+        }
     if task in ('darcy', 'ns'):
         loader_kwargs['downsample'] = downsample
     if task == 'airfoil':
@@ -153,14 +163,45 @@ def main():
         loader_kwargs['downsamplex'] = data_cfg.get('downsamplex', 1)
         loader_kwargs['downsampley'] = data_cfg.get('downsampley', 1)
 
+    if task not in LOADERS:
+        raise ValueError(f'Unknown PDE task: {task}')
     data_info = LOADERS[task](**loader_kwargs)
     model = build_model(cfg, data_info)
     print(model)
     print(f"Total params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    train_cfg = cfg.get('training', {})
+    train_cfg = dict(cfg.get('training', {}))
     train_cfg['save_name'] = data_cfg.get('save_name', task)
-    train_pde(model, data_info, train_cfg)
+    if args.eval and not args.checkpoint:
+        parser.error('--eval requires --checkpoint')
+    train_cfg['eval_only'] = args.eval
+    train_cfg['checkpoint'] = args.checkpoint
+
+    try:
+        train_pde(model, data_info, train_cfg)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or 'out of memory' in str(exc).lower()
+        can_fallback = (
+            is_oom and task in TEMPORAL_TASKS and not args.eval
+            and 'physical_batch_size' not in train_cfg
+            and int(train_cfg.get('batch_size', 2)) > 1
+        )
+        if not can_fallback:
+            raise
+        effective_batch = int(train_cfg.get('batch_size', 2))
+        physical_batch = max(1, effective_batch // 2)
+        if effective_batch % physical_batch != 0:
+            raise
+        logging.warning(
+            'CUDA OOM with physical batch %d; restarting from the same seed with '
+            'physical batch %d and gradient accumulation %d (effective batch %d).',
+            effective_batch, physical_batch, effective_batch // physical_batch, effective_batch)
+        del model
+        torch.cuda.empty_cache()
+        set_seed(data_cfg.get('seed', 42))
+        model = build_model(cfg, data_info)
+        train_cfg['physical_batch_size'] = physical_batch
+        train_pde(model, data_info, train_cfg)
 
 
 if __name__ == '__main__':

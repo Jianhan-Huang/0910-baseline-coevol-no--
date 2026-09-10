@@ -1,0 +1,52 @@
+                            loss += myloss(im.reshape(bsz, -1), y.reshape(bsz, -1))
+                            fx = shift_history_tokens(
+                                fx, im, T_in=data_info['T_in'],
+                                frame_channels=data_info['frame_channels'],
+                                dynamic_channels=data_info['dynamic_channels'])
+                            preds.append(im)
+                    rel_err += loss.item()
+                    if task_type == 'ns':
+                        pred = torch.cat(preds, -1)
+                        test_full_loss += myloss(pred.reshape(bsz, -1), yy.reshape(bsz, -1)).item()
+                    else:
+                        pred = torch.stack(preds, dim=2)
+                        test_full_loss += myloss(pred.reshape(bsz, -1), yy.reshape(bsz, -1)).item()
+            else:
+                for batch in test_loader:
+                    if len(batch) == 3:
+                        pos_or_x, fx_or_pos, y = batch
+                    else:
+                        continue
+                    pos_or_x = pos_or_x.to(device)
+                    fx_or_pos = fx_or_pos.to(device)
+                    y = y.to(device)
+                    if task_type in ('pipe', 'airfoil_pde', 'elasticity'):
+                        out = model(None, pos_or_x).squeeze(-1)
+                    else:
+                        out = model(fx_or_pos, pos_or_x).squeeze(-1)
+                    if y_normalizer is not None:
+                        out = y_normalizer.decode(out)
+                    rel_err += myloss(out, y).item()
+
+        rel_err /= ntest * data_info['T_out'] if task_type in ('ns', 'temporal') else ntest
+        if task_type in ('ns', 'temporal'):
+            test_full_loss /= ntest
+            logger.info(
+                f"Epoch {ep} Train loss: {train_loss:.5f} "
+                f"test_step_loss: {rel_err:.5f} test_full_loss: {test_full_loss:.5f}")
+        else:
+            logger.info(f"Epoch {ep} Train loss: {train_loss:.5f} rel_err: {rel_err:.5f}")
+
+        if ep % 100 == 0 or ep == epochs - 1:
+            checkpoint = {
+                'epoch': ep,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+            }
+            torch.save(checkpoint, os.path.join(save_dir, f'{save_name}.pt'))
+
+    if task_type == 'temporal':
+        metrics = evaluate_complete_trajectories(model, data_info, cfg, device)
+        logger.info(f"Complete-trajectory metrics: {metrics}")
+    return model
